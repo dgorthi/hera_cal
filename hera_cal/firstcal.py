@@ -16,6 +16,7 @@ import omnical
 from pyuvdata import UVData
 
 
+
 def fit_line(phs, fqs, valid):
     '''Fit a line to data points (phs) at some given values (fqs).
 
@@ -373,6 +374,61 @@ class FirstCal(object):
         # turn solutions into dictionary
         return dict(zip(map(Antpol, self.info.subsetant, [self.info.nant] * len(self.info.subsetant)), self.xhat))
 
+    def calc_TT_dlys(self, dlys, antloc):
+	"""
+	Solves for tip-tilt delay slope across array (x-position and y-position)
+
+	dlys : ndarray, shape=(Nants)
+	    array containing delay for each antenna in seconds
+
+	antloc : ndarray, shape=(Nants, 3)
+	    array containing antennas positions for X, Y, and Z in meters
+	"""
+	# subtract average antenna position from antloc
+	antloc -= np.median(antloc, axis=0) - np.ones_like(antloc)
+
+	# construct A matrix [[x, y, z, 1], ... ]
+	A = np.vstack([antloc.T, np.ones((antloc.shape[0], 1)).T]).T
+
+	# get delay slopes
+	output = np.linalg.lstsq(A, dlys)
+	dly_slopes = output[0]
+
+	# construct per-antenna tau offset subtracted from total delay
+	tau = np.dot(dly_slopes[:3], antloc.T) - dly_slopes[-1]
+
+	return tau
+
+    def remove_degen(self, sols, info):
+	"""
+	firstcal remove tip-tilt degeneracy
+
+	sols : dictionary
+		antenna-pol instance as keys, delays as values
+
+	info : red-info object
+	"""
+	# get antenna numbers and sort through their dlys and locations
+	keys = sols.keys()
+        ants = [a.val for a in keys]
+        dly_arr = np.array([sols[a][0] for a in keys])[:, 0, :]
+	antloc = np.array([info.antloc[info.ant_index(a)] for a in ants]) * 2.99792e8 / 1e9
+
+	# solve for TT tau offsets
+        taus = []
+        for i, dlys in enumerate(dly_arr.T):
+            taus.append( self.calc_TT_dlys(dlys, antloc) )
+
+        taus = np.array(taus).T
+
+	# subtract from data
+	dly_arr -= taus
+
+	# pack back into dictionary
+	new_sols = dict([ (keys[i], np.matrix(dly_arr[i])) for i in range(len(keys)) ])
+
+        return new_sols
+
 
 def UVData_to_dict(uvdata_list, filetype='miriad'):
     """ Turn a list of UVData objects or filenames in to a data and flag dictionary.
@@ -488,7 +544,7 @@ def firstcal_run(files, opts, history):
 
         return data_dict
     
-    def _search_and_iterate_firstcal(uv, info, option_parser):
+    def _search_and_iterate_firstcal(uv, info, option_parser, remove_degen=True):
         '''Searches and iterates over firstcal
 
             Iteratively run firstcal and look for rotated antennas.
@@ -498,6 +554,7 @@ def firstcal_run(files, opts, history):
             uv (pyuvdata.UVData): UVData object
             info (FirstcalRedundantInfo): info object
             option_parser (OptionParser): option parser object
+	    remove_degen: bool, remove tip-tilt degeneracy if true
 
         Return:
             dict : firstcal solutions
@@ -520,6 +577,9 @@ def firstcal_run(files, opts, history):
                           verbose=option_parser.verbose,
                           average=option_parser.average, 
                           window='none')
+
+	    if remove_degen is True:
+		sols = fc.remove_degen(sols, info)
 
             # Now we need to check if antennas are flipped
             medians = {}
@@ -608,7 +668,7 @@ def firstcal_run(files, opts, history):
             print("Setting phase type to drift")
             uv_in.unphase_to_drift()
         
-        sols, rotated_antennas = _search_and_iterate_firstcal(uv_in, info, opts)
+        sols, rotated_antennas = _search_and_iterate_firstcal(uv_in, info, opts, remove_degen=opts.remove_degen)
         rotated_antennas = [str(ai) for (ai, pol) in rotated_antennas]
         # convert delays to a gain solution
         gain_solutions = {ai: omni.get_phase(uv_in.freq_array[0, :], sols[ai]) for ai in sols.keys()}
@@ -651,6 +711,7 @@ def firstcal_run(files, opts, history):
 
     return
 
+
 def firstcal_option_parser():
     """
     Create an optparse option parser for firstcal_run instances.
@@ -685,4 +746,6 @@ def firstcal_option_parser():
                  help='metrics from hera_qm about array qualities')
     o.add_option('--reds_tolerance', type='float', default=1.0,
                  help='Tolerance level for calculating reds. Default is 1.0ns')
+    o.add_option('--remove_degen', action='store_true',
+                 default=False, help="Remove Tip-Tilt degeneracy in firstcal solutions")
     return o
